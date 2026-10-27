@@ -11,15 +11,12 @@ const {
   mkdirSync,
   readdirSync,
   readlinkSync,
-  realpathSync,
   statSync,
   symlinkSync,
   unlinkSync,
   utimesSync,
 } = require("node:fs");
 const { dirname, isAbsolute, join, normalize, parse, resolve, sep } = require("node:path");
-
-const realpathNativeSync = realpathSync.native;
 
 const { EEXIST, EISDIR, EINVAL, ENOTDIR } = $processBindingConstants.os.errno;
 
@@ -190,32 +187,50 @@ function hasNameBeforeDotDot(path) {
   return false;
 }
 
-// The real path of `path`. A name that does not exist yet is a directory the copy makes, so `..` after it cancels it.
+// Puts the segments of `path` on `stack`, the first one on top.
+function pushSegments(stack: string[], path: string) {
+  const segments = StringPrototypeSplit.$call(path, "/");
+  for (let i = segments.length - 1; i >= 0; i--) stack.push(segments[i]);
+}
+
+// The real path of `path`, from lstat and readlink alone: fs.realpath needs /proc on Linux, read permission on macOS.
 function realPathOfSync(path) {
-  try {
-    return realpathNativeSync(path);
-  } catch (err: any) {
-    if (err.code !== "ENOENT") throw err;
-  }
   let real = isAbsolute(path) ? "/" : resolve(".");
   const missing: string[] = [];
-  const segments = StringPrototypeSplit.$call(path, "/");
-  for (let i = 0; i < segments.length; i++) {
-    const segment = segments[i];
+  const rest: string[] = [];
+  pushSegments(rest, path);
+  let links = 0;
+  while (rest.length) {
+    const segment = rest.pop()!;
     if (segment === "" || segment === ".") continue;
     if (segment === "..") {
+      // A name that does not exist yet is a directory the copy makes, so `..` cancels it.
       if (missing.length) missing.pop();
       else real = dirname(real);
-    } else if (missing.length) {
-      missing.push(segment);
-    } else {
-      try {
-        real = realpathNativeSync(join(real, segment));
-      } catch (err: any) {
-        if (err.code !== "ENOENT") throw err;
-        missing.push(segment);
-      }
+      continue;
     }
+    if (missing.length) {
+      missing.push(segment);
+      continue;
+    }
+    const next = real === "/" ? "/" + segment : real + "/" + segment;
+    let isLink;
+    try {
+      isLink = lstatSync(next).isSymbolicLink();
+    } catch (err: any) {
+      if (err.code !== "ENOENT") throw err;
+      missing.push(segment);
+      continue;
+    }
+    // More links than the system follows: stat() reports the loop (ELOOP).
+    if (isLink && ++links > 40) statSync(path);
+    if (!isLink || links > 40) {
+      real = next;
+      continue;
+    }
+    const target = readlinkSync(next);
+    if (isAbsolute(target)) real = "/";
+    pushSegments(rest, target);
   }
   return missing.length ? join(real, ArrayPrototypeJoin.$call(missing, "/")) : real;
 }
@@ -327,10 +342,11 @@ function checkPathsSync(src, dest, opts: CpOptions, walk?: CpWalk): CheckedPaths
     } else {
       const keepSrc = textDiffersSync(src);
       const keepDest = textDiffersSync(dest);
-      // node compares text (cp.js isSrcSubdir). `dereference` walks into links, so the text check stays there too.
+      // node compares text (cp.js isSrcSubdir). That check stays where the text of src is right, and with `dereference`.
       const inside =
         keepSrc || keepDest
-          ? isSrcSubdir(realPathOfSync(src), realPathOfSync(dest)) || (opts.dereference && isSrcSubdir(src, dest))
+          ? isSrcSubdir(realPathOfSync(src), realPathOfSync(dest)) ||
+            ((!keepSrc || opts.dereference) && isSrcSubdir(src, dest))
           : isSrcSubdir(src, dest);
       if (inside) throw fsCpSubdirOfSelfError(src, dest);
       return { __proto__: null, srcStat, destStat, skipped: false, walk: { keepSrc, keepDest, nested: false } };
@@ -354,7 +370,7 @@ function getStatsSync(src, dest, opts) {
   return { srcStat, destStat };
 }
 
-function checkParentPathsSync(src, srcStat, dest) {
+function checkParentPathsSync(src, srcStat, dest, walk?: CpWalk) {
   const srcParent = resolve(dirname(src));
   const destParent = resolve(dirname(dest));
   if (destParent === srcParent || destParent === parse(destParent).root) return;
@@ -362,7 +378,8 @@ function checkParentPathsSync(src, srcStat, dest) {
   try {
     destStat = statSync(destParent, { bigint: true });
   } catch (err: any) {
-    if (err.code === "ENOENT") return;
+    // Where a root keeps `name/..`, `destParent` is its text. One that does not resolve is not an ancestor.
+    if (err.code === "ENOENT" || (walk !== undefined && (walk.keepSrc || walk.keepDest))) return;
     throw err;
   }
   if (areIdentical(srcStat, destStat)) {
@@ -374,7 +391,7 @@ function checkParentPathsSync(src, srcStat, dest) {
       code: "EINVAL",
     });
   }
-  return checkParentPathsSync(src, srcStat, destParent);
+  return checkParentPathsSync(src, srcStat, destParent, walk);
 }
 
 // The native recursive copy (a single clonefile() on macOS) copies symlinks
@@ -411,7 +428,7 @@ function treeContainsOnlyFilesAndDirsSync(root) {
 function tryNativeFastPathSync(src, dest, opts: CpOptions & { filter: undefined }) {
   const checked = checkPathsSync(src, dest, opts);
   const { srcStat, destStat } = checked;
-  checkParentPathsSync(src, srcStat, dest);
+  checkParentPathsSync(src, srcStat, dest, checked.walk);
   if (srcStat.isDirectory() && !opts.recursive) {
     throw fsEisdirError({
       message: `${src} is a directory (not copied)`,
@@ -444,7 +461,7 @@ function cpSyncFn(src, dest, opts, checked?) {
   // fallback doesn't re-run the same checkPaths/checkParentPaths syscalls.
   const { srcStat, destStat, skipped, walk } = checked ?? checkPathsSync(src, dest, opts);
   if (skipped) return;
-  if (checked === undefined) checkParentPathsSync(src, srcStat, dest);
+  if (checked === undefined) checkParentPathsSync(src, srcStat, dest, walk);
   return checkParentDir(destStat, src, dest, opts, walk);
 }
 
@@ -591,7 +608,7 @@ function copyDir(src, dest, opts, walk: CpWalk) {
 function linkDirSync(link, walk: CpWalk | undefined) {
   const dir = dirname(link);
   if (walk !== undefined && !walk.keepSrc && !walk.keepDest) return dir;
-  // path.resolve(dir, "../x") cancels a `name/..` in `dir` as text, also when `dir` and its text are one directory.
+  // Unlike node's JS walkers, which resolve against the text of `dir`: path.resolve() cancels its `name/..`.
   return hasNameBeforeDotDot(dir) ? realPathOfSync(dir) : dir;
 }
 
@@ -669,6 +686,7 @@ export default {
   isSrcSubdir,
   fsCpSubdirOfSelfError,
   hasNameBeforeDotDot,
+  pushSegments,
   childPathPrefix,
   childPath,
 };

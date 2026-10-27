@@ -648,7 +648,41 @@ describe.skipIf(isWindows)("a root that holds <symlink>/..", () => {
 
       await copy(`${dir}/from`, `${dir}/app/cur/../v2/copy`, { recursive: true });
       expect(tree(`${dir}/releases/v2/copy`)).toEqual(from);
+
+      await copy(`${dir}/from`, `${dir}/app/cur/../v2/two/levels`, { recursive: true });
+      expect(tree(`${dir}/releases/v2/two/levels`)).toEqual(from);
     });
+
+    test("does not need read permission on a directory above the destination", async () => {
+      using dir = fixture();
+      // The path goes through `app`, which the copy can search but not list.
+      fs.chmodSync(`${dir}/app`, 0o311);
+      try {
+        await copy(`${dir}/from`, `${dir}/app/cur/../copy`, { recursive: true });
+      } finally {
+        fs.chmodSync(`${dir}/app`, 0o755);
+      }
+      expect(tree(`${dir}/releases/copy`)).toEqual(from);
+    });
+
+    // The same as main and node: the text check of node stays where the text of the source is right.
+    test.each([false, true])(
+      "refuses when the text of the destination is inside the source, with its text twin: %p",
+      async twin => {
+        using dir = fixture();
+        fs.mkdirSync(`${dir}/releases/sub`);
+        if (twin) fs.mkdirSync(`${dir}/app/sub`);
+        const before = tree(`${dir}`);
+        let err: any;
+        try {
+          await copy(`${dir}/app`, `${dir}/app/cur/../sub/copy`, { recursive: true });
+        } catch (e) {
+          err = e;
+        }
+        expect(err?.code).toBe("ERR_FS_CP_EINVAL");
+        expect(tree(`${dir}`)).toEqual(before);
+      },
+    );
 
     test("resolves a link target below a link that has the name of its target directory", async () => {
       using dir = fixture();
@@ -676,41 +710,6 @@ describe.skipIf(isWindows)("a root that holds <symlink>/..", () => {
         "ERR_INVALID_ARG_TYPE",
       ]);
     });
-  });
-
-  // Bun's realpath reads /proc/self/fd on Linux. Where it cannot, a path without a link copies as it did before.
-  test("copies a root with <directory>/.. when realpath fails for every path", async () => {
-    using dir = fixture();
-    await using proc = Bun.spawn({
-      cmd: [
-        bunExe(),
-        "-e",
-        `
-          const fs = require("node:fs");
-          const fail = () => {
-            throw Object.assign(new Error("ENOENT: no such file or directory, realpath"), { code: "ENOENT" });
-          };
-          fs.realpathSync.native = fail;
-          fs.promises.realpath = async () => fail();
-          fs.cpSync("from/sub/../../from", "out1", { recursive: true });
-          await fs.promises.cp("from/sub/../../from", "out2", { recursive: true });
-          console.log(JSON.stringify([fs.readdirSync("out1").sort(), fs.readdirSync("out2").sort()]));
-        `,
-      ],
-      env: bunEnv,
-      cwd: String(dir),
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
-    expect({ stdout: stdout.trim(), stderr }).toEqual({
-      stdout: JSON.stringify([
-        ["a.txt", "sub"],
-        ["a.txt", "sub"],
-      ]),
-      stderr: "",
-    });
-    expect(exitCode).toBe(0);
   });
 });
 
