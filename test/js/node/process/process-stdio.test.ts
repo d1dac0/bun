@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "bun";
 import { describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, isLinux, isWindows } from "harness";
 import { release } from "node:os";
+import { closeSync, openSync } from "node:fs";
 import path from "path";
 import { isatty } from "tty";
 describe.concurrent("process-stdio", () => {
@@ -398,3 +399,98 @@ describe.concurrent.skipIf(isWindows)(
     );
   },
 );
+
+// fd 0, 1 and 2 belong to the process. A stream that reads one of them does not own it: when the stream ends, is cancelled
+// or fails, the descriptor stays open, and so no later open gets its number.
+describe.concurrent.skipIf(isWindows)("a reader of the process's own stdio leaves the descriptor open", () => {
+  // A reader that closes its descriptor does so on the work pool. The stat calls go through the same pool, so such a close
+  // has run when they settle. A number that was closed can be taken again at once (by the event loop, for example), so the
+  // report says what kind of file is behind each number, not only that one is open.
+  const report = `
+    const fs = require("node:fs");
+    for (let i = 0; i < 8; i++) await fs.promises.stat(".");
+    const stdio = [0, 1, 2].map(fd => {
+      try {
+        const stat = fs.fstatSync(fd);
+        for (const kind of ["Socket", "FIFO", "File", "Directory", "CharacterDevice"]) if (stat["is" + kind]()) return kind;
+        return "other";
+      } catch (e) {
+        return e.code;
+      }
+    });
+    const next = fs.openSync(process.execPath, "r");
+    fs.writeSync(1, JSON.stringify({ stdio, nextOpenSync: next > 2 ? "above 2" : next, threw: globalThis.threw }));
+    process.exit(0);
+  `;
+
+  // "pipe" is a socketpair.
+  async function run(cmd: string[], stdin: "pipe" | "ignore" | number | ReturnType<typeof Bun.file>, input?: string) {
+    await using proc = spawn({ cmd, env: bunEnv, stdin, stdout: "pipe", stderr: "pipe" });
+    if (stdin === "pipe") {
+      if (input) proc.stdin!.write(input);
+      await proc.stdin!.end();
+    }
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    // Without a report the child did not reach its end: show what it printed.
+    return stdout.startsWith("{") ? { ...JSON.parse(stdout), exitCode } : { stdout, stderr, exitCode };
+  }
+  const untouched = (stdin: string) => ({ stdio: [stdin, "Socket", "Socket"], nextOpenSync: "above 2", exitCode: 0 });
+
+  test.each([
+    ["Bun.stdin.stream() read to the end", `for await (const _ of Bun.stdin.stream());`],
+    [
+      "Bun.stdin.stream() cancelled",
+      `const reader = Bun.stdin.stream().getReader(); await reader.read(); await reader.cancel();`,
+    ],
+    [
+      "process.stdin read to the end",
+      `await new Promise(resolve => process.stdin.on("data", () => {}).on("end", resolve));`,
+    ],
+    [
+      "process.stdin destroyed",
+      `await new Promise(resolve => process.stdin.once("data", () => process.stdin.on("close", resolve).destroy()));`,
+    ],
+    ["console read as an async iterator", `for await (const _ of console);`],
+  ])("%s, stdin is a socket", async (_, script) => {
+    expect(await run([bunExe(), "-e", script + report], "pipe", "a\nb\n")).toEqual(untouched("Socket"));
+  });
+
+  const readToEnd = `for await (const _ of Bun.stdin.stream());`;
+
+  test("Bun.stdin.stream() read to the end, stdin is a regular file", async () => {
+    expect(await run([bunExe(), "-e", readToEnd + report], Bun.file(import.meta.path))).toEqual(untouched("File"));
+  });
+
+  test("Bun.stdin.stream() read to the end, stdin is /dev/null", async () => {
+    expect(await run([bunExe(), "-e", readToEnd + report], "ignore")).toEqual(untouched("CharacterDevice"));
+  });
+
+  test("Bun.stdin.stream() fails, stdin is a directory", async () => {
+    const fd = openSync(import.meta.dir, "r");
+    try {
+      const script = `try { ${readToEnd} } catch (e) { globalThis.threw = e.code; }`;
+      expect(await run([bunExe(), "-e", script + report], fd)).toEqual({ ...untouched("Directory"), threw: "EISDIR" });
+    } finally {
+      closeSync(fd);
+    }
+  });
+
+  test("Bun.stdin.stream() fails, stdin is closed", async () => {
+    const script = `require("node:fs").closeSync(0); try { ${readToEnd} } catch (e) { globalThis.threw = e.code; }`;
+    expect(await run([bunExe(), "-e", script + report], "ignore")).toEqual({
+      stdio: ["EBADF", "Socket", "Socket"],
+      nextOpenSync: 0,
+      threw: "EBADF",
+      exitCode: 0,
+    });
+  });
+
+  test.each([1, 2])("Bun.file(%d).stream() cancelled", async fd => {
+    const script = `const reader = Bun.file(${fd}).stream().getReader(); reader.read(); await reader.cancel();`;
+    expect(await run([bunExe(), "-e", script + report], "ignore")).toEqual(untouched("CharacterDevice"));
+  });
+
+  test("bun run - reads the script from stdin", async () => {
+    expect(await run([bunExe(), "run", "-"], "pipe", report)).toEqual(untouched("Socket"));
+  });
+});

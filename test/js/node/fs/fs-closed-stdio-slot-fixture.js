@@ -123,10 +123,10 @@ function freeSlot() {
       continue;
     }
     if (family === onWorkPool) {
-      while (slotState() !== "closed") await new Promise(resolve => setImmediate(resolve));
-    } else if (slotState() !== "closed") {
-      leftOpen[name] = slotState();
+      const deadline = Date.now() + 2000;
+      while (slotState() !== "closed" && Date.now() < deadline) await new Promise(resolve => setImmediate(resolve));
     }
+    if (slotState() !== "closed") leftOpen[name] = slotState();
     operations++;
   }
 
