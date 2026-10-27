@@ -1,8 +1,9 @@
-// Usage: bun fs-closed-stdio-slot-fixture.js <slot> <dir> <family>
+// Usage: bun fs-closed-stdio-slot-fixture.js <slot> <dir> <family> [libc]
 //
 // Closes fd <slot> (0, 1 or 2) and runs one family of operations that open and close descriptors
 // of their own. The kernel gives a new descriptor the lowest free number, so each operation gets
 // number <slot> for its first open. The fixture reports which operations left a descriptor there.
+// With [libc], close(2) from that library closes the slot, through bun:ffi, and not fs.closeSync.
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -10,6 +11,9 @@ const path = require("node:path");
 const slot = Number(process.argv[2]);
 const dir = process.argv[3];
 const family = process.argv[4];
+const close = process.argv[5]
+  ? require("bun:ffi").dlopen(process.argv[5], { close: { args: ["int"], returns: "int" } }).symbols.close
+  : fs.closeSync;
 
 const file = path.join(dir, "data.txt");
 const tree = path.join(dir, "tree");
@@ -107,7 +111,7 @@ function slotState() {
 }
 
 function freeSlot() {
-  if (slotState() !== "closed") fs.closeSync(slot);
+  if (slotState() !== "closed") close(slot);
 }
 
 (async () => {

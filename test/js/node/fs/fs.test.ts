@@ -11,6 +11,7 @@ import {
   isLinux,
   isPosix,
   isWindows,
+  libcPathForDlopen,
   tempDir,
   tempDirWithFiles,
   tmpdirSync,
@@ -7521,6 +7522,22 @@ describe("fs.close on stdio descriptors", () => {
 
   // The kernel gives a new descriptor the lowest free number, which is N once fd N is closed. An
   // operation that opens a descriptor for itself gets that number, and has to close it again.
+  async function closedSlotFixture(slot: number, family: string, ...libc: string[]) {
+    using dir = tempDir("fs-closed-stdio-slot", {});
+    const fixture = join(import.meta.dir, "fs-closed-stdio-slot-fixture.js");
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), fixture, String(slot), String(dir), family, ...libc],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    const written = join(String(dir), "result.json");
+    const result = existsSync(written) ? readFileSync(written, "utf8") : "";
+    // Without a result the fixture did not reach its end: show what it printed.
+    return result ? { ...JSON.parse(result), exitCode } : { stdout, stderr, exitCode };
+  }
+
   describe.each([0, 1, 2])("a descriptor opened while fd %d is closed is closed again by", slot => {
     it.concurrent.skipIf(isWindows).each([
       ["node:fs sync operations", 11],
@@ -7528,24 +7545,24 @@ describe("fs.close on stdio descriptors", () => {
       ["the module loader and Bun APIs", 12],
       ["a stream and a writer, on the work pool", 2],
     ])("%s", async (family, operations) => {
-      using dir = tempDir("fs-closed-stdio-slot", {});
-      await using proc = Bun.spawn({
-        cmd: [bunExe(), join(import.meta.dir, "fs-closed-stdio-slot-fixture.js"), String(slot), String(dir), family],
-        env: bunEnv,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
-      const written = join(String(dir), "result.json");
-      const result = existsSync(written) ? readFileSync(written, "utf8") : "";
-      // Without a result the fixture did not reach its end: show what it printed.
-      expect(result ? { ...JSON.parse(result), exitCode } : { stdout, stderr, exitCode }).toEqual({
+      expect(await closedSlotFixture(slot, family)).toEqual({
         operations,
         leftOpen: {},
         nextOpenSync: slot,
         secondCloseSync: "EBADF",
         exitCode: 0,
       });
+    });
+  });
+
+  // It does not matter who closed the descriptor: here close(2) is called through bun:ffi.
+  it.concurrent.skipIf(isWindows)("a descriptor opened while fd 0 is closed by bun:ffi is closed again", async () => {
+    expect(await closedSlotFixture(0, "node:fs sync operations", libcPathForDlopen())).toEqual({
+      operations: 11,
+      leftOpen: {},
+      nextOpenSync: 0,
+      secondCloseSync: "EBADF",
+      exitCode: 0,
     });
   });
 
