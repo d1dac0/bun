@@ -25,8 +25,7 @@ macro_rules! output_line {
 }
 
 pub fn write_line(line: std::fmt::Arguments<'_>) {
-    let _ =
-        bun_sys::File::from_fd(bun_core::Fd::stdout()).write_all(format!("{line}\n").as_bytes());
+    let _ = bun_sys::File::stdout().write_all(format!("{line}\n").as_bytes());
 }
 
 pub fn read_file(path: &[u8]) -> Option<Vec<u8>> {

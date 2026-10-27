@@ -60,18 +60,19 @@ impl File {
         // SAFETY: `File` is `#[repr(transparent)]` over `Fd`.
         unsafe { &*(core::ptr::from_ref(fd).cast::<File>()) }
     }
-    /// `bun.sys.File.from(.stdin())` — wrap the cached stdin fd. Do not close.
+    /// The process's own stdin. Nobody owns it, so this value never closes it.
     #[inline]
-    pub fn stdin() -> Self {
-        Self {
+    pub fn stdin() -> core::mem::ManuallyDrop<Self> {
+        core::mem::ManuallyDrop::new(Self {
             handle: Fd::stdin(),
-        }
+        })
     }
+    /// The process's own stdout. Nobody owns it, so this value never closes it.
     #[inline]
-    pub fn stdout() -> Self {
-        Self {
+    pub fn stdout() -> core::mem::ManuallyDrop<Self> {
+        core::mem::ManuallyDrop::new(Self {
             handle: Fd::stdout(),
-        }
+        })
     }
 
     pub fn open(path: &ZStr, flags: i32, mode: Mode) -> Maybe<Self> {

@@ -1170,8 +1170,6 @@ impl<'a> Repl<'a> {
             self.stdin_buf_start += 1;
             return Some(b);
         }
-        // Refill buffer (stdio fd: `File::Drop` is a no-op, so this is safe to
-        // re-create on every call).
         let stdin = sys::File::stdin();
         let n = match stdin.read(&mut self.stdin_buf) {
             sys::Result::Ok(n) => n,
