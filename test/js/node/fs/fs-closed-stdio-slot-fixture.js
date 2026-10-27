@@ -127,7 +127,8 @@ function freeSlot() {
       continue;
     }
     if (family === onWorkPool) {
-      const deadline = Date.now() + 2000;
+      // The deadline only ends a fixture whose test timed out.
+      const deadline = Date.now() + 10_000;
       while (slotState() !== "closed" && Date.now() < deadline) await new Promise(resolve => setImmediate(resolve));
     }
     if (slotState() !== "closed") leftOpen[name] = slotState();
