@@ -6612,7 +6612,7 @@ pub(crate) trait FileCloser: Sized {
 
         if is_allowed_to_close_fd
             && self.opened_fd() != Fd::INVALID
-            && self.opened_fd().stdio_tag().is_none()
+            && (cfg!(unix) || self.opened_fd().stdio_tag().is_none())
         {
             #[cfg(windows)]
             bun_io::Closer::close(self.opened_fd(), self.loop_());

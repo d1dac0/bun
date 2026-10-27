@@ -200,6 +200,8 @@ pub(crate) unsafe extern "C" fn main(argc: c_int, argv: *const *const c_char) ->
     //    by `bun_sys`; `stdio::init()` calls C's `bun_initialize_process()` and
     //    wires stdout/stderr `Source`s.
     output::stdio::init();
+    #[cfg(unix)]
+    bun_sys::fd::startup_stdio::remember();
     let _flush = output::flush_guard();
     // After stdio::init (fd 0 is open even if we were exec'd with it closed), before any thread.
     #[cfg(any(target_os = "linux", target_os = "android"))]

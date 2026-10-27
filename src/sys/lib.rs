@@ -1957,6 +1957,7 @@ mod posix_impl {
         openat(dir, path, flags, mode)
     }
     pub fn close(fd: Fd) -> Maybe<()> {
+        fd::startup_stdio::closing(fd);
         // Call close ONCE; never retry on EINTR (Linux may have already
         // released the fd, retrying would close someone else's). Only EBADF surfaces.
         // Darwin uses `close$NOCANCEL` (avoid pthread cancellation point).
@@ -2597,7 +2598,7 @@ mod posix_impl {
     pub fn dup_at_least(fd: Fd, min: i32) -> Maybe<Fd> {
         fcntl(fd, libc::F_DUPFD_CLOEXEC, min as isize).map(|rc| Fd::from_native(rc as i32))
     }
-    /// A descriptor created while fd 0, 1 or 2 is closed gets that number, where [`FdExt::close`] skips it and a spawned child inherits it as stdio. Returns its duplicate at 3 or higher (same `FD_CLOEXEC` state) with `fd` closed, or `fd` itself when it is above stdio already or no higher number is free.
+    /// A descriptor created while fd 0, 1 or 2 is closed gets that number, where a spawned child inherits it as stdio and a write to that stdio number reaches it. Returns its duplicate at 3 or higher (same `FD_CLOEXEC` state) with `fd` closed, or `fd` itself when it is above stdio already or no higher number is free.
     pub(crate) fn move_above_stdio(fd: Fd) -> Fd {
         if fd.stdio_tag().is_none() {
             return fd;

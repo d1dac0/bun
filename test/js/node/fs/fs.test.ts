@@ -7518,6 +7518,98 @@ describe("fs.close on stdio descriptors", () => {
     expect(stdout.trim()).toBe("EBADF");
     expect(exitCode).toBe(0);
   });
+
+  // The kernel gives a new descriptor the lowest free number, which is N once fd N is closed. An
+  // operation that opens a descriptor for itself gets that number, and has to close it again.
+  describe.each([0, 1, 2])("a descriptor opened while fd %d is closed is closed again by", slot => {
+    it.concurrent.skipIf(isWindows).each([
+      ["node:fs sync operations", 11],
+      ["node:fs callback and promise operations", 12],
+      ["the module loader and Bun APIs", 12],
+      ["a stream and a writer, on the work pool", 2],
+    ])("%s", async (family, operations) => {
+      using dir = tempDir("fs-closed-stdio-slot", {});
+      await using proc = Bun.spawn({
+        cmd: [bunExe(), join(import.meta.dir, "fs-closed-stdio-slot-fixture.js"), String(slot), String(dir), family],
+        env: bunEnv,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      const written = join(String(dir), "result.json");
+      const result = existsSync(written) ? readFileSync(written, "utf8") : "";
+      // Without a result the fixture did not reach its end: show what it printed.
+      expect(result ? { ...JSON.parse(result), exitCode } : { stdout, stderr, exitCode }).toEqual({
+        operations,
+        leftOpen: {},
+        nextOpenSync: slot,
+        secondCloseSync: "EBADF",
+        exitCode: 0,
+      });
+    });
+  });
+
+  it.concurrent.skipIf(isWindows)("closeSync(2) allows redirect after a module was loaded", async () => {
+    using dir = tempDir("fs-close-stdio-redirect", {
+      "redirect-fixture.cjs": `
+        const fs = require("node:fs");
+        fs.writeSync(2, "PRE.");
+        fs.closeSync(2);
+        // The module loader opens this file and closes it again.
+        require("./loaded-after-close.cjs");
+        const fd = fs.openSync(process.argv[2], "w");
+        process.stdout.write(String(fd));
+        fs.writeSync(2, "POST.");
+      `,
+      "loaded-after-close.cjs": `module.exports = 1;`,
+    });
+    const redirected = join(String(dir), "redirected.txt");
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), join(String(dir), "redirect-fixture.cjs"), redirected],
+      env: bunEnv,
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, redirected: readFileSync(redirected, "utf8"), exitCode }).toEqual({
+      stdout: "2",
+      stderr: "PRE.",
+      redirected: "POST.",
+      exitCode: 0,
+    });
+  });
+
+  it.concurrent.skipIf(isWindows)("a write to the closed fd 1 does not reach a file that was appended to", async () => {
+    using dir = tempDir("fs-close-stdio-stray", {
+      "stray-write-fixture.cjs": `
+        const fs = require("node:fs");
+        fs.closeSync(1);
+        fs.appendFileSync(process.argv[2], "record.");
+        let stray;
+        try {
+          fs.writeSync(1, "stray.");
+          stray = "written";
+        } catch (e) {
+          stray = e.code;
+        }
+        fs.writeSync(2, stray);
+      `,
+    });
+    const log = join(String(dir), "log.txt");
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), join(String(dir), "stray-write-fixture.cjs"), log],
+      env: bunEnv,
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, log: readFileSync(log, "utf8"), exitCode }).toEqual({
+      stdout: "",
+      stderr: "EBADF",
+      log: "record.",
+      exitCode: 0,
+    });
+  });
 });
 
 // A throw inside a node-style async callback must surface as an

@@ -36,7 +36,13 @@ pub enum MakeLibUvOwnedError {
 // `use bun_sys::FdExt;` at call sites; or call `bun_sys::close(fd)` directly.
 // ──────────────────────────────────────────────────────────────────────────
 pub trait FdExt: Copy + Sized {
-    /// fd function will NOT CLOSE stdin/stdout/stderr.
+    /// The owner's close. On POSIX it closes the descriptor whatever its
+    /// number: one that the kernel numbered 0, 1 or 2 because that number was
+    /// free is closed like any other. So only the owner may call it. Whoever
+    /// holds the stdin, stdout or stderr the process started with borrows it
+    /// (`File::borrow`, `File::stdin()`) and never closes it; debug builds
+    /// panic on that close (`startup_stdio`). Windows still skips the standard
+    /// handles.
     /// Expects a VALID file descriptor object.
     ///
     /// Do not use fd on JS-provided file descriptors (e.g. in `fs.closeSync`).
@@ -46,15 +52,16 @@ pub trait FdExt: Copy + Sized {
     /// closing something completely unrelated; fd would cause weird behavior
     /// as you see EBADF errors in unrelated places.
     fn close(self);
-    /// fd function will NOT CLOSE stdin/stdout/stderr.
+    /// `close()` that returns the error.
     /// Prefer asserting that EBADF does not happen with `.close()`.
     fn close_allowing_bad_file_descriptor(
         self,
         return_address: Option<usize>,
     ) -> Option<sys::Error>;
-    /// fd allows you to close standard io. It also returns the error.
+    /// The raw close: it also closes the process's own stdin, stdout and
+    /// stderr, on every platform, and returns the error.
     /// Use fd API to implement `node:fs` close: stdio must actually close and
-    /// EBADF must surface to the caller. Consider fd the raw close method.
+    /// EBADF must surface to the caller.
     fn close_allowing_standard_io(self, return_address: Option<usize>) -> Option<sys::Error>;
     /// Assumes given a valid file descriptor. If error, the handle has not been closed.
     fn make_lib_uv_owned(self) -> Result<Fd, MakeLibUvOwnedError>;
@@ -77,15 +84,20 @@ impl FdExt for Fd {
         self,
         return_address: Option<usize>,
     ) -> Option<sys::Error> {
+        #[cfg(windows)]
         if self.stdio_tag().is_some() {
             log!("close({}) SKIPPED", self);
             return None;
         }
+        #[cfg(unix)]
+        startup_stdio::assert_owned(self);
         self.close_allowing_standard_io(return_address)
     }
 
     fn close_allowing_standard_io(self, return_address: Option<usize>) -> Option<sys::Error> {
         debug_assert!(self.is_valid()); // probably a UAF
+        #[cfg(unix)]
+        startup_stdio::closing(self);
 
         // Format the file descriptor for logging BEFORE closing it.
         // Otherwise the file descriptor is always invalid after closing it.
@@ -291,6 +303,70 @@ impl FdExt for Fd {
 //   getFdPath, getFdPathW, getFdPathZ.
 // TODO: move these methods defined in bun.sys.File to bun.sys, then delete
 // bun.sys.File.
+
+/// The owner's close has no number test on POSIX. What protects the stdin,
+/// stdout and stderr the process started with is that their holders never
+/// close them. Debug builds check that: an owner's close of fd 0, 1 or 2
+/// panics while that number still holds the file the process started with.
+#[cfg(unix)]
+pub mod startup_stdio {
+    use super::Fd;
+    #[cfg(debug_assertions)]
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    /// `(st_dev, st_ino)`.
+    #[cfg(debug_assertions)]
+    type FileId = (u64, u64);
+
+    /// Bit `n` is set once this crate closed fd `n`: whatever takes the number next has an owner.
+    #[cfg(debug_assertions)]
+    static CLOSED: AtomicU8 = AtomicU8::new(0);
+    /// The files behind fd 0, 1 and 2 at startup. Code outside this crate (`bun:ffi`, a native addon, usockets) can also close one of them, and then the number holds another file.
+    #[cfg(debug_assertions)]
+    static STARTED_WITH: std::sync::OnceLock<[Option<FileId>; 3]> = std::sync::OnceLock::new();
+
+    #[cfg(debug_assertions)]
+    fn file_id(fd: Fd) -> Option<FileId> {
+        let stat = crate::fstat(fd).ok()?;
+        Some((stat.st_dev as u64, stat.st_ino as u64))
+    }
+
+    /// Call once at startup, when fd 0, 1 and 2 are open and nothing has closed one yet.
+    #[inline]
+    pub fn remember() {
+        #[cfg(debug_assertions)]
+        let _ = STARTED_WITH.set([0, 1, 2].map(|n| file_id(Fd::from_native(n))));
+    }
+
+    /// For every close in this crate, before it closes `fd`.
+    #[inline(always)]
+    pub(crate) fn closing(fd: Fd) {
+        #[cfg(debug_assertions)]
+        if let n @ 0..=2 = fd.native() {
+            CLOSED.fetch_or(1 << n, Ordering::Relaxed);
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = fd;
+    }
+
+    /// For the owner's close, before it closes `fd`.
+    #[inline(always)]
+    pub(crate) fn assert_owned(fd: Fd) {
+        #[cfg(debug_assertions)]
+        if let n @ 0..=2 = fd.native() {
+            if CLOSED.load(Ordering::Relaxed) & (1 << n) != 0 {
+                return;
+            }
+            let started_with = STARTED_WITH.get().and_then(|ids| ids[n as usize]);
+            assert!(
+                started_with.is_none() || started_with != file_id(fd),
+                "close({fd}): this is a descriptor the process started with. Its holder borrows it and must not close it.",
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = fd;
+    }
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // Platform helpers (Windows libuv / macOS close_nocancel).

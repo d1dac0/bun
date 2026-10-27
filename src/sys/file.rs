@@ -1,9 +1,11 @@
 //! `bun.sys.File` — high-level file handle.
 //!
-//! Owns the descriptor; closes it on Drop (skipping `Fd::INVALID` and stdio
-//! so `File::stdin()`/`stdout()`/`stderr()` and default-constructed handles
-//! are safe to drop). Use [`File::into_raw`] to hand the fd off,
-//! [`File::borrow`] for a non-owning `&File` view of someone else's fd.
+//! Owns the descriptor; closes it on Drop, whatever its number (skipping only
+//! `Fd::INVALID`, so default-constructed handles are safe to drop). Windows
+//! also skips the standard handles. Use [`File::into_raw`] to hand the fd off,
+//! [`File::borrow`] for a non-owning `&File` view of someone else's fd, and
+//! [`File::stdin`]/[`File::stdout`] for the process's own stdio, which no
+//! `File` owns.
 //! All methods preserve OS errno via [`crate::Maybe`].
 
 use super::*;
@@ -16,10 +18,23 @@ pub struct File {
 impl Drop for File {
     #[inline]
     fn drop(&mut self) {
-        if self.handle != Fd::INVALID && !self.handle.is_stdio() {
-            let _ = close(self.handle);
-        }
+        let _ = close_owned(self.handle);
     }
+}
+
+/// The close behind `Drop` and [`File::close`].
+#[inline]
+fn close_owned(fd: Fd) -> Maybe<()> {
+    if fd == Fd::INVALID {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    if fd.is_stdio() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    crate::fd::startup_stdio::assert_owned(fd);
+    close(fd)
 }
 
 /// `{ bytes, err? }` pair so callers can recover the partially-read
@@ -310,11 +325,7 @@ impl File {
     /// Close now. Equivalent to dropping `self` but the syscall result is
     /// observable. Skips the same sentinels as `Drop`.
     pub fn close(self) -> Maybe<()> {
-        let fd = self.into_raw();
-        if fd == Fd::INVALID || fd.is_stdio() {
-            return Ok(());
-        }
-        close(fd)
+        close_owned(self.into_raw())
     }
     /// `File.closeAndMoveTo` — atomically rename `src` → `dest` (cwd-relative),
     /// closing the handle after the rename so `move_file_z_with_handle`'s
