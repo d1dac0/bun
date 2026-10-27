@@ -48,7 +48,7 @@ async function realPathOf(path) {
   } catch (err: any) {
     if (err.code !== "ENOENT") throw err;
   }
-  let real = isAbsolute(path) ? "/" : await realpath(".");
+  let real = isAbsolute(path) ? "/" : resolve(".");
   const missing: string[] = [];
   const segments = StringPrototypeSplit.$call(path, "/");
   for (let i = 0; i < segments.length; i++) {
@@ -73,7 +73,12 @@ async function realPathOf(path) {
 
 // See textDiffersSync(). The caller checks hasNameBeforeDotDot() first, so other paths add no await.
 async function textDiffers(path) {
-  return (await realPathOf(path)) !== (await realPathOf(normalize(path)));
+  const real = await realPathOf(path);
+  try {
+    return real !== (await realPathOf(normalize(path)));
+  } catch {
+    return true;
+  }
 }
 
 async function checkPaths(src, dest, opts, walk?: CpWalk) {
@@ -407,17 +412,13 @@ async function copyDir(src, dest, opts, walk: CpWalk) {
   }
 }
 
-// See linkDirSync().
-async function linkDir(dir) {
-  return (await textDiffers(dir)) ? realPathOf(dir) : dir;
-}
-
 async function onLink(destStat, src, dest, opts, walk: CpWalk | undefined) {
   const textIsDir = walk !== undefined && !walk.keepSrc && !walk.keepDest;
   let resolvedSrc = await readlink(src);
   if (!opts.verbatimSymlinks && !isAbsolute(resolvedSrc)) {
     let srcDir = dirname(src);
-    if (!textIsDir && hasNameBeforeDotDot(srcDir)) srcDir = await linkDir(srcDir);
+    // See linkDirSync().
+    if (!textIsDir && hasNameBeforeDotDot(srcDir)) srcDir = await realPathOf(srcDir);
     resolvedSrc = resolve(srcDir, resolvedSrc);
   }
   if (!destStat) {
@@ -437,7 +438,7 @@ async function onLink(destStat, src, dest, opts, walk: CpWalk | undefined) {
   }
   if (!isAbsolute(resolvedDest)) {
     let destDir = dirname(dest);
-    if (!textIsDir && hasNameBeforeDotDot(destDir)) destDir = await linkDir(destDir);
+    if (!textIsDir && hasNameBeforeDotDot(destDir)) destDir = await realPathOf(destDir);
     resolvedDest = resolve(destDir, resolvedDest);
   }
   // stat(src) follows the link; a dangling src symlink throws ENOENT here,

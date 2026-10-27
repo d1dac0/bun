@@ -19,6 +19,8 @@ const {
 } = require("node:fs");
 const { dirname, isAbsolute, join, normalize, parse, resolve, sep } = require("node:path");
 
+const realpathNativeSync = realpathSync.native;
+
 const { EEXIST, EISDIR, EINVAL, ENOTDIR } = $processBindingConstants.os.errno;
 
 const ArrayPrototypeEvery = Array.prototype.every;
@@ -191,11 +193,11 @@ function hasNameBeforeDotDot(path) {
 // The real path of `path`. A name that does not exist yet is a directory the copy makes, so `..` after it cancels it.
 function realPathOfSync(path) {
   try {
-    return realpathSync.native(path);
+    return realpathNativeSync(path);
   } catch (err: any) {
     if (err.code !== "ENOENT") throw err;
   }
-  let real = isAbsolute(path) ? "/" : realpathSync.native(".");
+  let real = isAbsolute(path) ? "/" : resolve(".");
   const missing: string[] = [];
   const segments = StringPrototypeSplit.$call(path, "/");
   for (let i = 0; i < segments.length; i++) {
@@ -208,7 +210,7 @@ function realPathOfSync(path) {
       missing.push(segment);
     } else {
       try {
-        real = realpathSync.native(join(real, segment));
+        real = realpathNativeSync(join(real, segment));
       } catch (err: any) {
         if (err.code !== "ENOENT") throw err;
         missing.push(segment);
@@ -220,7 +222,14 @@ function realPathOfSync(path) {
 
 // True when the system and path.resolve() give `path` different directories.
 function textDiffersSync(path) {
-  return hasNameBeforeDotDot(path) && realPathOfSync(path) !== realPathOfSync(normalize(path));
+  if (!hasNameBeforeDotDot(path)) return false;
+  const real = realPathOfSync(path);
+  try {
+    return real !== realPathOfSync(normalize(path));
+  } catch {
+    // The caller did not give the text form. If it does not resolve (a file in the way), it is not this directory.
+    return true;
+  }
 }
 
 // `keep`: `dir` as given plus the name, as node's C++ CpSyncCopyDir (`src / name`). If not: what path.join() gives.
@@ -582,7 +591,8 @@ function copyDir(src, dest, opts, walk: CpWalk) {
 function linkDirSync(link, walk: CpWalk | undefined) {
   const dir = dirname(link);
   if (walk !== undefined && !walk.keepSrc && !walk.keepDest) return dir;
-  return textDiffersSync(dir) ? realPathOfSync(dir) : dir;
+  // path.resolve(dir, "../x") cancels a `name/..` in `dir` as text, also when `dir` and its text are one directory.
+  return hasNameBeforeDotDot(dir) ? realPathOfSync(dir) : dir;
 }
 
 function onLink(destStat, src, dest, opts, walk: CpWalk | undefined) {

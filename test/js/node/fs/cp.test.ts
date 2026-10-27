@@ -637,20 +637,80 @@ describe.skipIf(isWindows)("a root that holds <symlink>/..", () => {
       expect(fs.readlinkSync(`${dir}/out-link`)).toBe(`${dir}/releases/config.json`);
     });
 
-    test("a Buffer root with <symlink>/.. does the same as a Buffer root without", async () => {
+    test("a file in the way of the text form does not stop the copy", async () => {
       using dir = fixture();
-      const outcome = async (src: string, dest: string) => {
+      // `app/v2` is the text form of `app/cur/../v2`. Here it is a file.
+      fs.writeFileSync(`${dir}/app/v2`, "in the way");
+      fs.symlinkSync("../config.json", `${dir}/releases/v2/up`);
+
+      await copy(`${dir}/app/cur/..`, `${dir}/out`, { recursive: true });
+      expect(tree(`${dir}/out`)).toEqual({ ...releases, "v2/up": `-> ${dir}/releases/config.json` });
+
+      await copy(`${dir}/from`, `${dir}/app/cur/../v2/copy`, { recursive: true });
+      expect(tree(`${dir}/releases/v2/copy`)).toEqual(from);
+    });
+
+    test("resolves a link target below a link that has the name of its target directory", async () => {
+      using dir = fixture();
+      // `app/same/../same` and its text form `app/same` are one directory. Its parent is `releases`, not `app`.
+      fs.mkdirSync(`${dir}/releases/same`);
+      fs.symlinkSync("../releases/same", `${dir}/app/same`);
+      fs.symlinkSync("../config.json", `${dir}/releases/same/up`);
+
+      await copy(`${dir}/app/same/..`, `${dir}/out`, { recursive: true });
+      expect(fs.readlinkSync(`${dir}/out/same/up`)).toBe(`${dir}/releases/config.json`);
+    });
+
+    test("a Buffer root with <symlink>/.. throws as a Buffer root without it does", async () => {
+      using dir = fixture();
+      const code = async (src: string) => {
         try {
-          await copy(Buffer.from(src), dest, { recursive: true });
+          await copy(Buffer.from(src), `${dir}/out`, { recursive: true });
         } catch (e: any) {
           return e.code;
         }
-        return tree(dest);
+        return "copied";
       };
-      expect(await outcome(`${dir}/app/cur/..`, `${dir}/out1`)).toEqual(
-        await outcome(`${dir}/releases`, `${dir}/out2`),
-      );
+      expect([await code(`${dir}/app/cur/..`), await code(`${dir}/releases`)]).toEqual([
+        "ERR_INVALID_ARG_TYPE",
+        "ERR_INVALID_ARG_TYPE",
+      ]);
     });
+  });
+
+  // Bun's realpath reads /proc/self/fd on Linux. Where it cannot, a path without a link copies as it did before.
+  test("copies a root with <directory>/.. when realpath fails for every path", async () => {
+    using dir = fixture();
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `
+          const fs = require("node:fs");
+          const fail = () => {
+            throw Object.assign(new Error("ENOENT: no such file or directory, realpath"), { code: "ENOENT" });
+          };
+          fs.realpathSync.native = fail;
+          fs.promises.realpath = async () => fail();
+          fs.cpSync("from/sub/../../from", "out1", { recursive: true });
+          await fs.promises.cp("from/sub/../../from", "out2", { recursive: true });
+          console.log(JSON.stringify([fs.readdirSync("out1").sort(), fs.readdirSync("out2").sort()]));
+        `,
+      ],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout: stdout.trim(), stderr }).toEqual({
+      stdout: JSON.stringify([
+        ["a.txt", "sub"],
+        ["a.txt", "sub"],
+      ]),
+      stderr: "",
+    });
+    expect(exitCode).toBe(0);
   });
 });
 
