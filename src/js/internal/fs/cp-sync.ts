@@ -11,17 +11,21 @@ const {
   mkdirSync,
   readdirSync,
   readlinkSync,
+  realpathSync,
   statSync,
   symlinkSync,
   unlinkSync,
   utimesSync,
 } = require("node:fs");
-const { dirname, isAbsolute, join, parse, resolve, sep } = require("node:path");
+const { dirname, isAbsolute, join, normalize, parse, resolve, sep } = require("node:path");
 
 const { EEXIST, EISDIR, EINVAL, ENOTDIR } = $processBindingConstants.os.errno;
 
 const ArrayPrototypeEvery = Array.prototype.every;
 const ArrayPrototypeFilter = Array.prototype.filter;
+const ArrayPrototypeJoin = Array.prototype.join;
+const StringPrototypeIndexOf = String.prototype.indexOf;
+const StringPrototypeSlice = String.prototype.slice;
 const StringPrototypeSplit = String.prototype.split;
 
 // COPYFILE_EXCL | COPYFILE_FICLONE | COPYFILE_FICLONE_FORCE
@@ -67,6 +71,16 @@ function fsCpEExistError(context) {
 
 function fsCpEinvalError(context) {
   return decorateSystemError($ERR_FS_CP_EINVAL(context.message), "Invalid src or dest", context);
+}
+
+function fsCpSubdirOfSelfError(src, dest) {
+  return fsCpEinvalError({
+    message: `cannot copy ${src} to a subdirectory of self ${dest}`,
+    path: dest,
+    syscall: "cp",
+    errno: EINVAL,
+    code: "EINVAL",
+  });
 }
 
 function fsCpFifoPipeError(context) {
@@ -157,7 +171,77 @@ function isSrcSubdir(src, dest) {
   return ArrayPrototypeEvery.$call(srcArr, (cur, i) => destArr[i] === cur);
 }
 
+// path.join("app/cur/..", "x") is "app/x". The system gives "releases/x" when app/cur links to releases/v2.
+function hasNameBeforeDotDot(path) {
+  if (process.platform === "win32" || typeof path !== "string") return false;
+  if (StringPrototypeIndexOf.$call(path, "..") === -1) return false;
+  const segments = StringPrototypeSplit.$call(path, "/");
+  let sawName = false;
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    if (segment === "..") {
+      if (sawName) return true;
+    } else if (segment !== "" && segment !== ".") {
+      sawName = true;
+    }
+  }
+  return false;
+}
+
+// The real path of `path`. A name that does not exist yet is a directory the copy makes, so `..` after it cancels it.
+function realPathOfSync(path) {
+  try {
+    return realpathSync.native(path);
+  } catch (err: any) {
+    if (err.code !== "ENOENT") throw err;
+  }
+  let real = isAbsolute(path) ? "/" : realpathSync.native(".");
+  const missing: string[] = [];
+  const segments = StringPrototypeSplit.$call(path, "/");
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    if (segment === "" || segment === ".") continue;
+    if (segment === "..") {
+      if (missing.length) missing.pop();
+      else real = dirname(real);
+    } else if (missing.length) {
+      missing.push(segment);
+    } else {
+      try {
+        real = realpathSync.native(join(real, segment));
+      } catch (err: any) {
+        if (err.code !== "ENOENT") throw err;
+        missing.push(segment);
+      }
+    }
+  }
+  return missing.length ? join(real, ArrayPrototypeJoin.$call(missing, "/")) : real;
+}
+
+// True when the system and path.resolve() give `path` different directories.
+function textDiffersSync(path) {
+  return hasNameBeforeDotDot(path) && realPathOfSync(path) !== realPathOfSync(normalize(path));
+}
+
+// `keep`: `dir` as given plus the name, as node's C++ CpSyncCopyDir (`src / name`). If not: what path.join() gives.
+function childPathPrefix(dir, keep) {
+  if (process.platform === "win32") return dir;
+  if (keep) return dir[dir.length - 1] === "/" ? dir : dir + "/";
+  return StringPrototypeSlice.$call(join(dir, "x"), 0, -1);
+}
+
+function childPath(prefix, name) {
+  return process.platform === "win32" ? join(prefix, name) : prefix + name;
+}
+
 type BigIntStats = import("node:fs").BigIntStats;
+
+// One per copy of a directory. A root keeps its path as given in child paths when textDiffersSync() is true for it.
+interface CpWalk {
+  keepSrc: boolean;
+  keepDest: boolean;
+  nested: boolean; // false until the root directory is listed
+}
 
 interface CpOptions {
   dereference: boolean;
@@ -175,6 +259,7 @@ interface CheckedPaths {
   srcStat: BigIntStats;
   destStat: BigIntStats | null | undefined;
   skipped: false;
+  walk?: CpWalk; // for the two roots, when src is a directory
 }
 
 interface SkippedPaths {
@@ -185,8 +270,8 @@ interface SkippedPaths {
 }
 
 function checkPathsSync(src, dest, opts: CpOptions & { filter: undefined }): CheckedPaths;
-function checkPathsSync(src, dest, opts: CpOptions): CheckedPaths | SkippedPaths;
-function checkPathsSync(src, dest, opts: CpOptions): CheckedPaths | SkippedPaths {
+function checkPathsSync(src, dest, opts: CpOptions, walk?: CpWalk): CheckedPaths | SkippedPaths;
+function checkPathsSync(src, dest, opts: CpOptions, walk?: CpWalk): CheckedPaths | SkippedPaths {
   if (opts.filter) {
     const shouldCopy = opts.filter(src, dest);
     if ($isPromise(shouldCopy)) {
@@ -226,14 +311,21 @@ function checkPathsSync(src, dest, opts: CpOptions): CheckedPaths | SkippedPaths
     }
   }
 
-  if (srcStat.isDirectory() && isSrcSubdir(src, dest)) {
-    throw fsCpEinvalError({
-      message: `cannot copy ${src} to a subdirectory of self ${dest}`,
-      path: dest,
-      syscall: "cp",
-      errno: EINVAL,
-      code: "EINVAL",
-    });
+  if (srcStat.isDirectory()) {
+    if (walk !== undefined) {
+      // A child path that keeps `name/..` is not text to compare. Its roots passed the check.
+      if (!walk.keepSrc && !walk.keepDest && isSrcSubdir(src, dest)) throw fsCpSubdirOfSelfError(src, dest);
+    } else {
+      const keepSrc = textDiffersSync(src);
+      const keepDest = textDiffersSync(dest);
+      // node compares text (cp.js isSrcSubdir). `dereference` walks into links, so the text check stays there too.
+      const inside =
+        keepSrc || keepDest
+          ? isSrcSubdir(realPathOfSync(src), realPathOfSync(dest)) || (opts.dereference && isSrcSubdir(src, dest))
+          : isSrcSubdir(src, dest);
+      if (inside) throw fsCpSubdirOfSelfError(src, dest);
+      return { __proto__: null, srcStat, destStat, skipped: false, walk: { keepSrc, keepDest, nested: false } };
+    }
   }
   return { __proto__: null, srcStat, destStat, skipped: false };
 }
@@ -326,7 +418,8 @@ function tryNativeFastPathSync(src, dest, opts: CpOptions & { filter: undefined 
     // node's walker: dest must not exist (no merge semantics) and the tree
     // must contain only regular files and directories.
     return {
-      ok: process.platform === "darwin" && !destStat && treeContainsOnlyFilesAndDirsSync(src),
+      // The scan below joins as text, so a src that is not its text takes the walker.
+      ok: process.platform === "darwin" && !destStat && !checked.walk!.keepSrc && treeContainsOnlyFilesAndDirsSync(src),
       checked,
     };
   }
@@ -340,24 +433,24 @@ function tryNativeFastPathSync(src, dest, opts: CpOptions & { filter: undefined 
 function cpSyncFn(src, dest, opts, checked?) {
   // `checked` carries the stats from a preceding tryNativeFastPathSync so the
   // fallback doesn't re-run the same checkPaths/checkParentPaths syscalls.
-  const { srcStat, destStat, skipped } = checked ?? checkPathsSync(src, dest, opts);
+  const { srcStat, destStat, skipped, walk } = checked ?? checkPathsSync(src, dest, opts);
   if (skipped) return;
   if (checked === undefined) checkParentPathsSync(src, srcStat, dest);
-  return checkParentDir(destStat, src, dest, opts);
+  return checkParentDir(destStat, src, dest, opts, walk);
 }
 
-function checkParentDir(destStat, src, dest, opts) {
+function checkParentDir(destStat, src, dest, opts, walk: CpWalk | undefined) {
   const destParent = dirname(dest);
   if (!existsSync(destParent)) mkdirSync(destParent, { recursive: true });
-  return getStats(destStat, src, dest, opts);
+  return getStats(destStat, src, dest, opts, walk);
 }
 
-function getStats(destStat, src, dest, opts) {
+function getStats(destStat, src, dest, opts, walk: CpWalk | undefined) {
   const statSyncFn = opts.dereference ? statSync : lstatSync;
   const srcStat = statSyncFn(src);
 
   if (srcStat.isDirectory() && opts.recursive) {
-    return onDir(srcStat, destStat, src, dest, opts);
+    return onDir(srcStat, destStat, src, dest, opts, walk ?? { keepSrc: false, keepDest: false, nested: false });
   } else if (srcStat.isDirectory()) {
     throw fsEisdirError({
       message: `${src} is a directory (not copied)`,
@@ -369,7 +462,7 @@ function getStats(destStat, src, dest, opts) {
   } else if (srcStat.isFile() || srcStat.isCharacterDevice() || srcStat.isBlockDevice()) {
     return onFile(srcStat, destStat, src, dest, opts);
   } else if (srcStat.isSymbolicLink()) {
-    return onLink(destStat, src, dest, opts);
+    return onLink(destStat, src, dest, opts, walk);
   } else if (srcStat.isSocket()) {
     throw fsCpSocketError({
       message: `cannot copy a socket file: ${dest}`,
@@ -450,8 +543,8 @@ function setDestTimestamps(src, dest) {
   return utimesSync(dest, updatedSrcStat.atime, updatedSrcStat.mtime);
 }
 
-function onDir(srcStat, destStat, src, dest, opts) {
-  if (!destStat) return mkDirAndCopy(srcStat.mode, src, dest, opts);
+function onDir(srcStat, destStat, src, dest, opts, walk: CpWalk) {
+  if (!destStat) return mkDirAndCopy(srcStat.mode, src, dest, opts, walk);
   if (opts.errorOnExist && !opts.force) {
     throw fsCpEExistError({
       message: `${dest} already exists`,
@@ -461,29 +554,41 @@ function onDir(srcStat, destStat, src, dest, opts) {
       code: "EEXIST",
     });
   }
-  return copyDir(src, dest, opts);
+  return copyDir(src, dest, opts, walk);
 }
 
-function mkDirAndCopy(srcMode, src, dest, opts) {
+function mkDirAndCopy(srcMode, src, dest, opts, walk: CpWalk) {
   mkdirSync(dest);
-  copyDir(src, dest, opts);
+  copyDir(src, dest, opts, walk);
   return setDestMode(dest, srcMode);
 }
 
-function copyDir(src, dest, opts) {
-  for (const dirent of readdirSync(src, { withFileTypes: true })) {
+function copyDir(src, dest, opts, walk: CpWalk) {
+  const dirents = readdirSync(src, { withFileTypes: true });
+  if (dirents.length === 0) return;
+  const srcPrefix = childPathPrefix(src, walk.nested || walk.keepSrc);
+  const destPrefix = childPathPrefix(dest, walk.nested || walk.keepDest);
+  walk.nested = true;
+  for (const dirent of dirents) {
     const { name } = dirent;
-    const srcItem = join(src, name);
-    const destItem = join(dest, name);
-    const { destStat, skipped } = checkPathsSync(srcItem, destItem, opts);
-    if (!skipped) getStats(destStat, srcItem, destItem, opts);
+    const srcItem = childPath(srcPrefix, name);
+    const destItem = childPath(destPrefix, name);
+    const { destStat, skipped } = checkPathsSync(srcItem, destItem, opts, walk);
+    if (!skipped) getStats(destStat, srcItem, destItem, opts, walk);
   }
 }
 
-function onLink(destStat, src, dest, opts) {
+// The directory to resolve a relative link target against. `walk` is undefined when the link is a root.
+function linkDirSync(link, walk: CpWalk | undefined) {
+  const dir = dirname(link);
+  if (walk !== undefined && !walk.keepSrc && !walk.keepDest) return dir;
+  return textDiffersSync(dir) ? realPathOfSync(dir) : dir;
+}
+
+function onLink(destStat, src, dest, opts, walk: CpWalk | undefined) {
   let resolvedSrc = readlinkSync(src);
   if (!opts.verbatimSymlinks && !isAbsolute(resolvedSrc)) {
-    resolvedSrc = resolve(dirname(src), resolvedSrc);
+    resolvedSrc = resolve(linkDirSync(src, walk), resolvedSrc);
   }
   if (!destStat) {
     return symlinkSync(resolvedSrc, dest);
@@ -501,7 +606,7 @@ function onLink(destStat, src, dest, opts) {
     throw err;
   }
   if (!isAbsolute(resolvedDest)) {
-    resolvedDest = resolve(dirname(dest), resolvedDest);
+    resolvedDest = resolve(linkDirSync(dest, walk), resolvedDest);
   }
   let srcIsDir = false;
   try {
@@ -552,4 +657,8 @@ export default {
   fsEisdirError,
   areIdentical,
   isSrcSubdir,
+  fsCpSubdirOfSelfError,
+  hasNameBeforeDotDot,
+  childPathPrefix,
+  childPath,
 };
