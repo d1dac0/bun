@@ -476,7 +476,7 @@ describe.skipIf(isWindows)("a root that holds <symlink>/..", () => {
   const releases = { "config.json": "live", "v2": "dir", "v2/inner.txt": "inner" };
   const from = { "a.txt": "a", "sub": "dir", "sub/b.txt": "b" };
 
-  describe.each(impls)("fs.%s", (_, copy) => {
+  describe.concurrent.each(impls)("fs.%s", (_, copy) => {
     test.each([
       ["app/cur/..", releases],
       ["app/cur/../", releases],
