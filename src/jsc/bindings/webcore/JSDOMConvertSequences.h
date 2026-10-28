@@ -33,7 +33,6 @@
 #include <JavaScriptCore/JSArray.h>
 #include <JavaScriptCore/JSGlobalObjectInlines.h>
 #include <JavaScriptCore/ObjectConstructor.h>
-#include <array>
 #include <limits>
 #include <type_traits>
 #include "BunIDLConvertBase.h"
@@ -104,38 +103,6 @@ struct SequenceTraits<
     }
 };
 
-template<typename IDLType, size_t arraySize>
-struct SequenceTraits<IDLType, std::array<typename IDLType::ImplementationType, arraySize>> {
-    using VectorType = std::array<typename IDLType::ImplementationType, arraySize>;
-
-    static void reserveExact(
-        JSC::JSGlobalObject& lexicalGlobalObject,
-        VectorType& sequence,
-        size_t size)
-    {
-        auto& vm = JSC::getVM(&lexicalGlobalObject);
-        auto scope = DECLARE_THROW_SCOPE(vm);
-        if (size != arraySize) {
-            throwTypeError(&lexicalGlobalObject, scope);
-        }
-    }
-
-    template<typename T>
-    static void append(
-        JSC::JSGlobalObject& lexicalGlobalObject,
-        VectorType& sequence,
-        size_t index,
-        T&& element)
-    {
-        auto& vm = JSC::getVM(&lexicalGlobalObject);
-        auto scope = DECLARE_THROW_SCOPE(vm);
-        if (index >= arraySize) {
-            throwTypeError(&lexicalGlobalObject, scope);
-        }
-        sequence[index] = std::forward<T>(element);
-    }
-};
-
 template<typename IDLType, typename VectorType = Vector<typename IDLType::SequenceStorageType>>
 struct GenericSequenceConverter {
     using Traits = SequenceTraits<IDLType, VectorType>;
@@ -171,10 +138,6 @@ struct GenericSequenceConverter {
         });
 
         RETURN_IF_EXCEPTION(scope, {});
-        // This could be the case if `VectorType` is `std::array`.
-        if (index != result.size()) {
-            throwTypeError(&lexicalGlobalObject, scope);
-        }
         return WTF::move(result);
     }
 
@@ -203,10 +166,6 @@ struct GenericSequenceConverter {
         });
 
         RETURN_IF_EXCEPTION(scope, {});
-        // This could be the case if `VectorType` is `std::array`.
-        if (index != result.size()) {
-            throwTypeError(&lexicalGlobalObject, scope);
-        }
         return WTF::move(result);
     }
 
@@ -231,10 +190,6 @@ struct GenericSequenceConverter {
         });
 
         RETURN_IF_EXCEPTION(scope, {});
-        // This could be the case if `VectorType` is `std::array`.
-        if (index != result.size()) {
-            throwTypeError(&lexicalGlobalObject, scope);
-        }
         return WTF::move(result);
     }
 };

@@ -45,7 +45,6 @@ using namespace JSC;
     macro(atimeMs) \
     macro(attributes) \
     macro(autoAllocateChunkSize) \
-    macro(basename) \
     macro(birthtimeMs) \
     macro(blob) \
     macro(body) \
@@ -81,13 +80,11 @@ using namespace JSC;
     macro(exchange) \
     macro(expires) \
     macro(exports) \
-    macro(extname) \
     macro(fastPath) \
     macro(fatal) \
     macro(fd) \
     macro(filename) \
     macro(flush) \
-    macro(format) \
     macro(globScan) \
     macro(globScanSync) \
     macro(handleEvent) \
@@ -112,7 +109,6 @@ using namespace JSC;
     macro(isPrepared) \
     macro(isUncloneable) \
     macro(isUntransferable) \
-    macro(join) \
     macro(json) \
     macro(kResistStopPropagation) \
     macro(lazy) \
@@ -144,7 +140,6 @@ using namespace JSC;
     macro(overridableRequire) \
     macro(ownReadableState) \
     macro(ownWritableState) \
-    macro(parse) \
     macro(partitioned) \
     macro(path) \
     macro(paths) \
@@ -191,13 +186,11 @@ using namespace JSC;
     macro(statusMessage) \
     macro(statusText) \
     macro(storage) \
-    macro(stream) \
     macro(syscall) \
     macro(text) \
     macro(textDecoderStreamDecoder) \
     macro(textEncoderStreamEncoder) \
     macro(toClass) \
-    macro(toNamespacedPath) \
     macro(transform) \
     macro(type) \
     macro(updateRef) \
