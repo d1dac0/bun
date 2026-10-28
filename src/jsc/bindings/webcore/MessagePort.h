@@ -114,6 +114,9 @@ public:
     };
     void jsRef(JSGlobalObject*, ListenerHold = ListenerHold::Switch);
     void jsUnref(JSGlobalObject*, ListenerHold = ListenerHold::Switch);
+    void setMessageHandlerIsInert(bool isInert) { m_messageHandlerIsInert = isInert; }
+    // Reconciles the listener event-loop ref with (m_isRefd && a 'message' listener that can run).
+    void updateListenerEventLoopRef();
     // Report the actual loop-ref state (matches Node's uv_has_ref), not the intent flag.
     bool jsHasRef() { return m_hasRef || m_listenerLoopRefActive; }
 
@@ -164,13 +167,13 @@ private:
     // independent of m_hasRef (the .onmessage=/.ref() keepalive).
     bool m_isRefd { true };
     // Whether the message-listener mechanism currently holds an event-loop ref
-    // (held iff m_isRefd && m_messageEventCount > 0).
-    bool m_listenerLoopRefActive { false };
+    // (held iff m_isRefd and a 'message' listener that can run is attached).
+    bool m_listenerLoopRefActive : 1 { false };
+    // onmessage holds an object that is not callable: it stays in the listener list, never runs, and holds no loop ref.
+    bool m_messageHandlerIsInert : 1 { false };
 
     uint32_t m_messageEventCount { 0 };
     static void onDidChangeListenerImpl(EventTarget& self, const AtomString& eventType, OnDidChangeListenerKind kind);
-    // Reconciles the listener event-loop ref with (m_isRefd && m_messageEventCount > 0).
-    void updateListenerEventLoopRef();
 };
 
 WebCoreOpaqueRoot root(MessagePort*);

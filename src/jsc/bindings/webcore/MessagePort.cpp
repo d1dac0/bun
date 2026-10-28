@@ -487,11 +487,11 @@ Vector<RefPtr<MessagePort>> MessagePort::entanglePorts(ScriptExecutionContext& c
     });
 }
 
-// Reconcile the message-listener loop-ref with (m_isRefd && m_messageEventCount > 0),
+// Reconcile the message-listener loop-ref with (m_isRefd && a 'message' listener that can run),
 // so .unref() releases the listener ref and .ref() re-acquires it.
 void MessagePort::updateListenerEventLoopRef()
 {
-    bool shouldHold = m_isRefd && m_messageEventCount > 0;
+    bool shouldHold = m_isRefd && m_messageEventCount > (m_messageHandlerIsInert ? 1u : 0u);
     if (shouldHold == m_listenerLoopRefActive)
         return;
     auto* context = scriptExecutionContext();
@@ -520,6 +520,7 @@ void MessagePort::onDidChangeListenerImpl(EventTarget& self, const AtomString& e
         break;
     case Clear:
         port.m_messageEventCount = 0;
+        port.m_messageHandlerIsInert = false;
         break;
     }
     port.updateListenerEventLoopRef();

@@ -195,7 +195,11 @@ static inline bool setJSMessagePort_onmessageSetter(JSGlobalObject& lexicalGloba
 {
     auto& vm = JSC::getVM(&lexicalGlobalObject);
     UNUSED_PARAM(vm);
+    // Before the listener list changes, so that the port's listener hook already leaves out a handler that cannot run.
+    thisObject.wrapped().setMessageHandlerIsInert(value.isObject() && !value.isCallable());
     setEventHandlerAttribute<JSEventListener>(thisObject.wrapped(), eventNames().messageEvent, value, thisObject);
+    // A handler that is replaced in place does not run the listener hook.
+    thisObject.wrapped().updateListenerEventLoopRef();
     vm.writeBarrier(&thisObject, value);
     ensureStillAliveHere(value);
 
@@ -203,10 +207,7 @@ static inline bool setJSMessagePort_onmessageSetter(JSGlobalObject& lexicalGloba
     // clears the handler and gives that hold back. The other 'message' listeners keep theirs.
     if (value.isCallable())
         thisObject.wrapped().jsRef(&lexicalGlobalObject, MessagePort::ListenerHold::Keep);
-    else if (value.isObject()) {
-        // Not callable, but still a counted 'message' listener: it never runs, so it must not hold the loop.
-        thisObject.wrapped().jsUnref(&lexicalGlobalObject);
-    } else
+    else
         thisObject.wrapped().jsUnref(&lexicalGlobalObject, MessagePort::ListenerHold::Keep);
 
     return true;
