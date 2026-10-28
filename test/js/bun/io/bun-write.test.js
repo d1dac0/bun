@@ -442,6 +442,83 @@ const IS_UV_FS_COPYFILE_DISABLED =
     expect(await Bun.write(Bun.stderr, new TextEncoder().encode("\nBun.write STDERR TEST\n\n"))).toBe(24);
   });
 
+  describe("empty stdio writes", () => {
+    const sources = ['""', "new Uint8Array()", "new Blob([])", "new Response(null)", "[]"];
+
+    test.concurrent.each(sources)("%s resolves zero for piped stdout and stderr", async source => {
+      const script = `
+        process.stdout.write("before-out\\n");
+        process.stderr.write("before-err\\n");
+        const counts = [await Bun.write(Bun.stdout, ${source}), await Bun.write(Bun.stderr, ${source})];
+        process.stdout.write(JSON.stringify(counts) + "\\nafter-out\\n");
+        process.stderr.write("after-err\\n");
+      `;
+      await using proc = Bun.spawn({ cmd: [bunExe(), "-e", script], env: bunEnv, stdout: "pipe", stderr: "pipe" });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect({ stdout, stderr, exitCode }).toEqual({
+        stdout: "before-out\n[0,0]\nafter-out\n",
+        stderr: "before-err\nafter-err\n",
+        exitCode: 0,
+      });
+    });
+
+    test.concurrent.each(sources)("%s preserves a shared stdout/stderr file", async source => {
+      using dir = tempDir("bun-write-empty-shared-stdio", { "out.log": "existing\n" });
+      const out = join(String(dir), "out.log");
+      const fd = fs.openSync(out, "a");
+      let exitCode;
+      try {
+        await using proc = Bun.spawn({
+          cmd: [
+            bunExe(),
+            "-e",
+            `
+            process.stdout.write("before\\n");
+            const counts = [await Bun.write(Bun.stdout, ${source}), await Bun.write(Bun.stderr, ${source})];
+            process.stderr.write(JSON.stringify(counts) + "\\nafter\\n");
+          `,
+          ],
+          env: bunEnv,
+          stdout: fd,
+          stderr: fd,
+        });
+        exitCode = await proc.exited;
+      } finally {
+        fs.closeSync(fd);
+      }
+      expect({ content: fs.readFileSync(out, "utf8"), exitCode }).toEqual({
+        content: "existing\nbefore\n[0,0]\nafter\n",
+        exitCode: 0,
+      });
+    });
+
+    test.concurrent.each(sources)("%s still truncates a path and creates missing parents", async source => {
+      using dir = tempDir("bun-write-empty-path", { "existing.txt": "existing" });
+      const existing = join(String(dir), "existing.txt");
+      const missing = join(String(dir), "missing", "out.txt");
+      const script = `
+        const counts = [await Bun.write(${JSON.stringify(existing)}, ${source}),
+          await Bun.write(Bun.file(${JSON.stringify(missing)}), ${source})];
+        process.stdout.write(JSON.stringify(counts));
+      `;
+      await using proc = Bun.spawn({ cmd: [bunExe(), "-e", script], env: bunEnv, stdout: "pipe", stderr: "pipe" });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      expect({
+        stdout,
+        stderr,
+        existing: fs.readFileSync(existing, "utf8"),
+        created: fs.readFileSync(missing, "utf8"),
+        exitCode,
+      }).toEqual({
+        stdout: "[0,0]",
+        stderr: "",
+        existing: "",
+        created: "",
+        exitCode: 0,
+      });
+    });
+  });
+
   // These tests pass by not throwing:
   it("Bun.write(Bun.stdout, Bun.file(path))", async () => {
     await Bun.write(Bun.stdout, Bun.file(path.join(import.meta.dir, "hello-world.txt")));
